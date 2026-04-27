@@ -171,6 +171,11 @@ FanucClient::~FanucClient()
   restoreSignalHandler();
 }
 
+void FanucClient::setLastError(const std::string& message) noexcept
+{
+  last_error_ = message;
+}
+
 void FanucClient::readStateFromQueue()
 {
   stream_motion::RobotStatusPacket robot_status;
@@ -212,16 +217,11 @@ void FanucClient::readStateFromQueue()
 
 void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
 {
-  AssertIsStreaming(is_streaming_);
-  readStateFromQueue();
-  last_joint_angles_cmd_ = joint_targets;
-
-  if (joint_targets.size() != last_joint_angles_.size())
+  const auto status = tryWriteJointTarget(joint_targets);
+  if (status != OperationStatus::kOk)
   {
-    throw std::invalid_argument("Joint targets size does not match the size of last joint angles.");
+    throw std::runtime_error(last_error_);
   }
-  auto cur_time_from_start = std::chrono::high_resolution_clock::now() - start_time_;
-  p_queue_impl_->command_queue_.enqueue({ cur_time_from_start, last_joint_angles_cmd_ });
 }
 
 void FanucClient::writeJointTargetRMI(const Eigen::VectorXd& joint_targets)
@@ -248,8 +248,11 @@ void FanucClient::writeJointTargetRMI(const Eigen::VectorXd& joint_targets)
 
 Eigen::Ref<const Eigen::VectorXd> FanucClient::readJointAngles()
 {
-  AssertIsStreaming(is_streaming_);
-  readStateFromQueue();
+  const auto status = tryReadJointAngles();
+  if (status != OperationStatus::kOk)
+  {
+    throw std::runtime_error(last_error_);
+  }
 
   return last_joint_angles_;
 }
@@ -437,12 +440,13 @@ bool FanucClient::getLimits(const double v_peak, const double payload, std::vect
   return true;
 }
 
-void FanucClient::startRMI()
+OperationStatus FanucClient::tryStartRMI() noexcept
 {
   if (rmi_running_)
   {
-    return;
+    return OperationStatus::kOk;
   }
+
   try
   {
     rmi_connection_->getStatus(std::nullopt);
@@ -457,13 +461,38 @@ void FanucClient::startRMI()
     rmi_connection_->getStatus(std::nullopt);
     rmi_connection_->initializeRemoteMotion(std::nullopt);
   }
+  catch (const std::exception& e)
+  {
+    setLastError(e.what());
+    return OperationStatus::kRmiError;
+  }
+  catch (...)
+  {
+    setLastError("Unknown exception while starting RMI.");
+    return OperationStatus::kUnknownError;
+  }
+
   rmi_running_ = true;
+  return OperationStatus::kOk;
+}
+
+void FanucClient::startRMI()
+{
+  const auto status = tryStartRMI();
+  if (status != OperationStatus::kOk)
+  {
+    throw std::runtime_error(last_error_);
+  }
 }
 
 // Throws if it fails to start real-time communication
-void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
+OperationStatus FanucClient::tryStartRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer) noexcept
 {
-  AssertNotStreaming(is_streaming_);
+  if (is_streaming_)
+  {
+    setLastError("Robot is currently streaming. Cannot start stream twice.");
+    return OperationStatus::kAlreadyStreaming;
+  }
 
   stream_motion::RobotStatusPacket status;
   try
@@ -476,7 +505,12 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
       stream_motion_->configureGPIO(gpio_buffer_->toStreamMotionConfig());
     }
 
-    startRMI();
+    const auto rmi_status = tryStartRMI();
+    if (rmi_status != OperationStatus::kOk)
+    {
+      return rmi_status;
+    }
+
     rmi_connection_->programCallNonBlocking("STREAM_MOTN");
 
     // Wait for the stream connection to be ready
@@ -499,11 +533,13 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
       {
         if (got_status)
         {
-          throw std::runtime_error(kStatusStatusNotReadyMessage);
+          setLastError(kStatusStatusNotReadyMessage);
+          return OperationStatus::kTimeout;
         }
         else
         {
-          throw std::runtime_error(kStatusPacketFailureMessage);
+          setLastError(kStatusPacketFailureMessage);
+          return OperationStatus::kTransportError;
         }
       }
     }
@@ -524,10 +560,12 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
       rt_thread_.join();
     }
     rt_thread_ = std::thread([this] { streamMotionThread(last_joint_angles_); });
+    return OperationStatus::kOk;
   }
-  catch (...)
+  catch (const std::exception& e)
   {
     is_streaming_ = false;
+    setLastError(e.what());
 
     try
     {
@@ -546,52 +584,109 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
     {
     }
 
-    throw;
+    return OperationStatus::kUnknownError;
+  }
+  catch (...)
+  {
+    is_streaming_ = false;
+    setLastError("Unknown exception while starting realtime stream.");
+
+    try
+    {
+      rmi_connection_->abort(std::nullopt);
+      rmi_running_ = false;
+    }
+    catch (...)
+    {
+    }
+
+    try
+    {
+      stream_motion_->sendStopPacket();
+    }
+    catch (...)
+    {
+    }
+
+    return OperationStatus::kUnknownError;
+  }
+}
+
+void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
+{
+  const auto status = tryStartRealtimeStream(std::move(gpio_buffer));
+  if (status != OperationStatus::kOk)
+  {
+    throw std::runtime_error(last_error_);
+  }
+}
+
+OperationStatus FanucClient::tryStopRealtimeStream() noexcept
+{
+  try
+  {
+    if (!is_streaming_)
+    {
+      if (rmi_running_)
+      {
+        rmi_connection_->abort(std::nullopt);
+        rmi_running_ = false;
+        stream_motion_->sendStopPacket();
+      }
+      return OperationStatus::kOk;
+    }
+
+    is_streaming_ = false;
+    if (rt_thread_.joinable())
+    {
+      rt_thread_.join();
+    }
+
+    // Wait for robot to stop motion
+    stream_motion::RobotStatusPacket status;
+    const auto motion_pre_loop_time = std::chrono::steady_clock::now();
+    do
+    {
+      if (std::chrono::steady_clock::now() - motion_pre_loop_time > std::chrono::seconds(1))
+      {
+        break;
+      }
+
+      const auto status_pre_loop_time = std::chrono::steady_clock::now();
+      while (!stream_motion_->getStatusPacket(status))
+      {
+        if (std::chrono::steady_clock::now() - status_pre_loop_time > std::chrono::seconds(1))
+        {
+          setLastError(kStatusPacketFailureMessage);
+          return OperationStatus::kTimeout;
+        }
+      }
+    } while (status.status & 0x8);
+
+    rmi_connection_->abort(std::nullopt);
+    rmi_running_ = false;
+    stream_motion_->sendStopPacket();
+    return OperationStatus::kOk;
+  }
+  catch (const std::exception& e)
+  {
+    setLastError(e.what());
+    return OperationStatus::kTransportError;
+  }
+  catch (...)
+  {
+    setLastError("Unknown exception while stopping realtime stream.");
+    return OperationStatus::kUnknownError;
   }
 }
 
 void FanucClient::stopRealtimeStream()
 {
-  if (!is_streaming_)
+  const auto status = tryStopRealtimeStream();
+  if (status != OperationStatus::kOk)
   {
-    if (rmi_running_)
-    {
-      rmi_connection_->abort(std::nullopt);
-      rmi_running_ = false;
-      stream_motion_->sendStopPacket();
-    }
-    return;
+    throw std::runtime_error(last_error_);
   }
-
-  is_streaming_ = false;
-  if (rt_thread_.joinable())
-  {
-    rt_thread_.join();
-  }
-
-  // Wait for robot to stop motion
-  stream_motion::RobotStatusPacket status;
-  const auto motion_pre_loop_time = std::chrono::steady_clock::now();
-  do
-  {
-    if (std::chrono::steady_clock::now() - motion_pre_loop_time > std::chrono::seconds(1))
-    {
-      break;
-    }
-
-    const auto status_pre_loop_time = std::chrono::steady_clock::now();
-    while (!stream_motion_->getStatusPacket(status))
-    {
-      if (std::chrono::steady_clock::now() - status_pre_loop_time > std::chrono::seconds(1))
-      {
-        throw std::runtime_error(kStatusPacketFailureMessage);
-      }
-    }
-  } while (status.status & 0x8);
-
-  rmi_connection_->abort(std::nullopt);
-  rmi_running_ = false;
-  stream_motion_->sendStopPacket();
 }
 
 bool FanucClient::isStreaming()
@@ -609,15 +704,104 @@ void FanucClient::setPayloadSchedule(const uint8_t payload_schedule) const
   rmi_connection_->setPayloadSchedule(payload_schedule, std::nullopt);
 }
 
+OperationStatus FanucClient::trySetPayloadSchedule(uint8_t payload_schedule) noexcept
+{
+  try
+  {
+    rmi_connection_->setPayloadSchedule(payload_schedule, std::nullopt);
+    return OperationStatus::kOk;
+  }
+  catch (const std::exception& e)
+  {
+    setLastError(e.what());
+    return OperationStatus::kRmiError;
+  }
+  catch (...)
+  {
+    setLastError("Unknown exception while setting payload schedule.");
+    return OperationStatus::kUnknownError;
+  }
+}
+
 void FanucClient::validateGPIOBuffer(const std::shared_ptr<GPIOBuffer>& gpio_buffer) const
+{
+  const auto status = const_cast<FanucClient*>(this)->tryValidateGPIOBuffer(gpio_buffer);
+  if (status != OperationStatus::kOk)
+  {
+    throw std::runtime_error(last_error_);
+  }
+}
+
+OperationStatus FanucClient::tryValidateGPIOBuffer(const std::shared_ptr<GPIOBuffer>& gpio_buffer) noexcept
 {
   if (gpio_buffer != nullptr)
   {
     if (!stream_motion_->configureGPIO(gpio_buffer->toStreamMotionConfig()))
     {
-      throw std::runtime_error(
-          "Failed to configure GPIO buffer. Ensure the GPIO buffer is correctly set up for the robot.");
+      setLastError("Failed to configure GPIO buffer. Ensure the GPIO buffer is correctly set up for the robot.");
+      return OperationStatus::kGpioError;
     }
+  }
+  return OperationStatus::kOk;
+}
+
+OperationStatus FanucClient::tryReadJointAngles() noexcept
+{
+  if (!is_streaming_)
+  {
+    setLastError("Robot is not streaming. Please ensure the real-time stream is running before reading.");
+    return OperationStatus::kNotStreaming;
+  }
+
+  try
+  {
+    readStateFromQueue();
+    return OperationStatus::kOk;
+  }
+  catch (const std::exception& e)
+  {
+    setLastError(e.what());
+    return OperationStatus::kTransportError;
+  }
+  catch (...)
+  {
+    setLastError("Unknown exception while reading joint angles.");
+    return OperationStatus::kUnknownError;
+  }
+}
+
+OperationStatus FanucClient::tryWriteJointTarget(const Eigen::VectorXd& joint_targets) noexcept
+{
+  if (!is_streaming_)
+  {
+    setLastError("Robot is not streaming. Please ensure the real-time stream is running before writing.");
+    return OperationStatus::kNotStreaming;
+  }
+
+  try
+  {
+    readStateFromQueue();
+    last_joint_angles_cmd_ = joint_targets;
+
+    if (joint_targets.size() != last_joint_angles_.size())
+    {
+      setLastError("Joint targets size does not match the size of last joint angles.");
+      return OperationStatus::kInvalidArgument;
+    }
+
+    auto cur_time_from_start = std::chrono::high_resolution_clock::now() - start_time_;
+    p_queue_impl_->command_queue_.enqueue({ cur_time_from_start, last_joint_angles_cmd_ });
+    return OperationStatus::kOk;
+  }
+  catch (const std::exception& e)
+  {
+    setLastError(e.what());
+    return OperationStatus::kTransportError;
+  }
+  catch (...)
+  {
+    setLastError("Unknown exception while writing joint target.");
+    return OperationStatus::kUnknownError;
   }
 }
 

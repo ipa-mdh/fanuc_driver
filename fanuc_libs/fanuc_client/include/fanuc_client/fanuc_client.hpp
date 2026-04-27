@@ -50,6 +50,19 @@ struct ForceSensor
   uint32_t fs_type;
 };
 
+enum class OperationStatus
+{
+  kOk = 0,
+  kAlreadyStreaming,
+  kNotStreaming,
+  kInvalidArgument,
+  kRmiError,
+  kTimeout,
+  kGpioError,
+  kTransportError,
+  kUnknownError,
+};
+
 class FanucClient
 {
 public:
@@ -78,11 +91,17 @@ public:
 
   void stopRealtimeStream();
 
+  OperationStatus tryStartRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer = nullptr) noexcept;
+
+  OperationStatus tryStopRealtimeStream() noexcept;
+
   void stopStreaming();
 
   bool isStreaming();
 
   void startRMI();
+
+  OperationStatus tryStartRMI() noexcept;
 
   bool getLimits(double v_peak, double payload, std::vector<double>& vel_limit, std::vector<double>& acc_limit,
                  std::vector<double>& jerk_limit) const;
@@ -91,7 +110,25 @@ public:
 
   void setPayloadSchedule(uint8_t payload_schedule) const;
 
+  OperationStatus trySetPayloadSchedule(uint8_t payload_schedule) noexcept;
+
   void validateGPIOBuffer(const std::shared_ptr<GPIOBuffer>& gpio_buffer) const;
+
+  OperationStatus tryValidateGPIOBuffer(const std::shared_ptr<GPIOBuffer>& gpio_buffer) noexcept;
+
+  OperationStatus tryReadJointAngles() noexcept;
+
+  OperationStatus tryWriteJointTarget(const Eigen::VectorXd& joint_targets) noexcept;
+
+  const std::string& lastError() const noexcept
+  {
+    return last_error_;
+  }
+
+  const Eigen::VectorXd& latestJointAngles() const
+  {
+    return last_joint_angles_;
+  }
 
   void setOutCmdInterpBuffTarget(uint32_t out_cmd_interp_buff_target)
   {
@@ -139,6 +176,8 @@ public:
   }
 
 private:
+  void setLastError(const std::string& message) noexcept;
+
   /** Setup signal handler for SIGINT */
   void setupSignalHandler();
 
@@ -205,6 +244,8 @@ private:
 
   // Force sensor default type
   uint32_t force_sensor_type_;
+
+  std::string last_error_;
 
   struct PQueueImpl;
   std::unique_ptr<PQueueImpl> p_queue_impl_;

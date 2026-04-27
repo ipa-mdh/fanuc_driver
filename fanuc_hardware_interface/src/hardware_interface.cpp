@@ -5,6 +5,7 @@
 
 #include "fanuc_robot_driver/hardware_interface.hpp"
 
+#include <charconv>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
@@ -28,24 +29,27 @@ using StatusGPIOTypes = ::fanuc_client::GPIOBuffer::StatusGPIOTypes;
 constexpr auto kFRHWInterface = "FR_HW_Interface";
 constexpr int kNumberConnectionAttempts = 5;
 
-int StringToInt(const std::string& param_name, const std::string& param_value)
+bool StringToInt(const std::string& param_name, const std::string& param_value, int& out_value)
 {
-  try
-  {
-    return std::stoi(param_value);
-  }
-  catch (const std::invalid_argument& e)
+  const char* begin = param_value.data();
+  const char* end = begin + param_value.size();
+  auto result = std::from_chars(begin, end, out_value);
+
+  if (result.ec == std::errc::invalid_argument || result.ptr != end)
   {
     RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Invalid integer parameter `%s` for parameter named `%s`",
                  param_value.c_str(), param_name.c_str());
-    throw;
+    return false;
   }
-  catch (const std::out_of_range& e)
+
+  if (result.ec == std::errc::result_out_of_range)
   {
     RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Integer parameter out of range: `%s` for parameter named `%s`",
                  param_value.c_str(), param_name.c_str());
-    throw;
+    return false;
   }
+
+  return true;
 }
 }  // namespace
 
@@ -336,19 +340,27 @@ FanucHardwareInterface::on_configure(const rclcpp_lifecycle::State& /*previous_s
 {
   RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "Preparing FANUC ROS2 HW interface");
   ip_address_ = info_.hardware_parameters["robot_ip"];
-  try
-  {
-    rmi_port_ = StringToInt("rmi_port", info_.hardware_parameters["rmi_port"]);
-    stream_motion_port_ = StringToInt("stream_motion_port", info_.hardware_parameters["stream_motion_port"]);
-    payload_schedule_ = StringToInt("payload_schedule", info_.hardware_parameters["payload_schedule"]);
-    out_cmd_interp_buff_target_ =
-        StringToInt("out_cmd_interp_buff_target", info_.hardware_parameters["out_cmd_interp_buff_target"]);
-    force_sensor_type_ = StringToInt("force_sensor_type", info_.hardware_parameters["force_sensor_type"]);
-  }
-  catch (const std::exception& e)
+  int parsed_rmi_port = 0;
+  int parsed_stream_motion_port = 0;
+  int parsed_payload_schedule = 0;
+  int parsed_out_cmd_interp_buff_target = 0;
+  int parsed_force_sensor_type = 0;
+
+  if (!StringToInt("rmi_port", info_.hardware_parameters["rmi_port"], parsed_rmi_port) ||
+      !StringToInt("stream_motion_port", info_.hardware_parameters["stream_motion_port"], parsed_stream_motion_port) ||
+      !StringToInt("payload_schedule", info_.hardware_parameters["payload_schedule"], parsed_payload_schedule) ||
+      !StringToInt("out_cmd_interp_buff_target", info_.hardware_parameters["out_cmd_interp_buff_target"],
+                   parsed_out_cmd_interp_buff_target) ||
+      !StringToInt("force_sensor_type", info_.hardware_parameters["force_sensor_type"], parsed_force_sensor_type))
   {
     return CallbackReturn::ERROR;
   }
+
+  rmi_port_ = static_cast<uint16_t>(parsed_rmi_port);
+  stream_motion_port_ = static_cast<uint16_t>(parsed_stream_motion_port);
+  payload_schedule_ = parsed_payload_schedule;
+  out_cmd_interp_buff_target_ = static_cast<uint32_t>(parsed_out_cmd_interp_buff_target);
+  force_sensor_type_ = static_cast<uint32_t>(parsed_force_sensor_type);
 
   RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "payload_schedule: " << payload_schedule_);
   RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "Starting RMI with: " << ip_address_);
@@ -361,21 +373,40 @@ FanucHardwareInterface::on_configure(const rclcpp_lifecycle::State& /*previous_s
     {
       fanuc_client_.reset();
       fanuc_client_ = std::make_unique<fanuc_client::FanucClient>(ip_address_, stream_motion_port_, rmi_port_);
-      fanuc_client_->setOutCmdInterpBuffTarget(out_cmd_interp_buff_target_);
-      fanuc_client_->setForceSensorType(force_sensor_type_);
-      fanuc_client_->startRMI();
-      fanuc_client_->setPayloadSchedule(payload_schedule_);
-      fanuc_client_->validateGPIOBuffer(gpio_buffer_);
+    }
+    catch (const std::exception& e)
+    {
+      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", e.what());
+      rclcpp::sleep_for(std::chrono::milliseconds(3000));
+      continue;
+    }
+
+    fanuc_client_->setOutCmdInterpBuffTarget(out_cmd_interp_buff_target_);
+    fanuc_client_->setForceSensorType(force_sensor_type_);
+
+    if (fanuc_client_->tryStartRMI() != fanuc_client::OperationStatus::kOk)
+    {
+      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", fanuc_client_->lastError().c_str());
+      rclcpp::sleep_for(std::chrono::milliseconds(3000));
+      continue;
+    }
+    if (fanuc_client_->trySetPayloadSchedule(payload_schedule_) != fanuc_client::OperationStatus::kOk)
+    {
+      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", fanuc_client_->lastError().c_str());
+      rclcpp::sleep_for(std::chrono::milliseconds(3000));
+      continue;
+    }
+    if (fanuc_client_->tryValidateGPIOBuffer(gpio_buffer_) != fanuc_client::OperationStatus::kOk)
+    {
+      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", fanuc_client_->lastError().c_str());
+      rclcpp::sleep_for(std::chrono::milliseconds(3000));
+      continue;
+    }
+
       RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "Successfully connected to the robot.");
       RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface),
                          "FANUC ROS2 HW interface is ready with client version: " << fanuc_client_->getClientVersion());
       return CallbackReturn::SUCCESS;
-    }
-    catch (std::runtime_error& e)
-    {
-      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", e.what());
-      rclcpp::sleep_for(std::chrono::milliseconds(3000));
-    }
   }
 
   RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Failed to connect to the robot.");
@@ -392,26 +423,26 @@ hardware_interface::CallbackReturn FanucHardwareInterface::on_activate(const rcl
     return CallbackReturn::ERROR;
   }
 
-  try
-  {
-    fanuc_client_->startRealtimeStream(gpio_buffer_);
-    joint_targets_degrees_ = fanuc_client_->readJointAngles();
-    joint_targets_.array() = M_PI / 180.0 * joint_targets_degrees_.array();
-    robot_status_.is_connected = 1.0;
-    return CallbackReturn::SUCCESS;
-  }
-  catch (const std::exception& e)
+  if (fanuc_client_->tryStartRealtimeStream(gpio_buffer_) != fanuc_client::OperationStatus::kOk)
   {
     robot_status_.is_connected = 0.0;
-    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Failed to activate hardware interface: %s", e.what());
+    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Failed to activate hardware interface: %s",
+                 fanuc_client_->lastError().c_str());
     return CallbackReturn::ERROR;
   }
-  catch (...)
+
+  if (fanuc_client_->tryReadJointAngles() != fanuc_client::OperationStatus::kOk)
   {
     robot_status_.is_connected = 0.0;
-    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Failed to activate hardware interface: unknown exception.");
+    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Failed to read initial joint state: %s",
+                 fanuc_client_->lastError().c_str());
     return CallbackReturn::ERROR;
   }
+
+  joint_targets_degrees_ = fanuc_client_->latestJointAngles();
+  joint_targets_.array() = M_PI / 180.0 * joint_targets_degrees_.array();
+  robot_status_.is_connected = 1.0;
+  return CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn FanucHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& previous_state)
@@ -420,17 +451,10 @@ hardware_interface::CallbackReturn FanucHardwareInterface::on_deactivate(const r
 
   if (fanuc_client_ != nullptr)
   {
-    try
+    if (fanuc_client_->tryStopRealtimeStream() != fanuc_client::OperationStatus::kOk)
     {
-      fanuc_client_->stopRealtimeStream();
-    }
-    catch (const std::exception& e)
-    {
-      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "Exception during deactivate: %s", e.what());
-    }
-    catch (...)
-    {
-      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "Unknown exception during deactivate.");
+      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "Exception during deactivate: %s",
+                  fanuc_client_->lastError().c_str());
     }
   }
 
@@ -514,19 +538,7 @@ hardware_interface::return_type FanucHardwareInterface::read(const rclcpp::Time&
   {
     if (fanuc_client_ != nullptr)
     {
-      try
-      {
-        fanuc_client_->stopRealtimeStream();
-      }
-      catch (const std::runtime_error& e)
-      {
-        RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Stream already stopped: %s", e.what());
-      }
-      catch (...)
-      {
-        // Catch any other exceptions during shutdown
-        RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Exception during stream shutdown (likely normal)");
-      }
+      fanuc_client_->tryStopRealtimeStream();
     }
 
     static auto last_log_time = std::chrono::steady_clock::now();
@@ -540,50 +552,43 @@ hardware_interface::return_type FanucHardwareInterface::read(const rclcpp::Time&
     return hardware_interface::return_type::ERROR;
   }
 
-  try
+  if (fanuc_client_->tryReadJointAngles() != fanuc_client::OperationStatus::kOk)
   {
-    fr_prev_joint_pos_ = fr_joint_pos_;
-    const Eigen::Ref<const Eigen::VectorXd> joint_angles = fanuc_client_->readJointAngles();
-    for (Eigen::Index i = 0; i < joint_angles.size(); ++i)
-    {
-      fr_joint_pos_[i] = M_PI / 180.0 * joint_angles[i];
-    }
-    if ((fr_prev_joint_pos_.array() != fr_joint_pos_.array()).any())
-    {
-      const double dt = static_cast<double>(fanuc_client_->getControlPeriod()) / 1000.0;
-      fr_joint_vel_ = (fr_joint_pos_ - fr_prev_joint_pos_) / dt;
-    }
-
-    for (const auto& io_state : io_state_)
-    {
-      io_state->updateValue();
-    }
-
-    robot_status_.in_error = fanuc_client_->robot_status().in_error;
-    robot_status_.tp_enabled = fanuc_client_->robot_status().tp_enabled;
-    robot_status_.e_stopped = fanuc_client_->robot_status().e_stopped;
-    robot_status_.motion_possible = fanuc_client_->robot_status().motion_possible;
-    robot_status_.contact_stop_mode = static_cast<double>(fanuc_client_->robot_status().contact_stop_mode);
-    robot_status_.collaborative_speed_scaling = static_cast<double>(fanuc_client_->robot_status().safety_scale);
-
-    force_sensor_.force_x = static_cast<double>(fanuc_client_->force_sensor().force_x);
-    force_sensor_.force_y = static_cast<double>(fanuc_client_->force_sensor().force_y);
-    force_sensor_.force_z = static_cast<double>(fanuc_client_->force_sensor().force_z);
-    force_sensor_.moment_x = static_cast<double>(fanuc_client_->force_sensor().moment_x);
-    force_sensor_.moment_y = static_cast<double>(fanuc_client_->force_sensor().moment_y);
-    force_sensor_.moment_z = static_cast<double>(fanuc_client_->force_sensor().moment_z);
-    force_sensor_.fs_type = static_cast<double>(fanuc_client_->force_sensor().fs_type);
-  }
-  catch (const std::exception& e)
-  {
-    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Exception during read (likely shutdown): %s", e.what());
+    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Read failed: %s", fanuc_client_->lastError().c_str());
     return hardware_interface::return_type::ERROR;
   }
-  catch (...)
+
+  fr_prev_joint_pos_ = fr_joint_pos_;
+  const Eigen::Ref<const Eigen::VectorXd> joint_angles = fanuc_client_->latestJointAngles();
+  for (Eigen::Index i = 0; i < joint_angles.size(); ++i)
   {
-    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Unknown exception during read (likely shutdown)");
-    return hardware_interface::return_type::ERROR;
+    fr_joint_pos_[i] = M_PI / 180.0 * joint_angles[i];
   }
+  if ((fr_prev_joint_pos_.array() != fr_joint_pos_.array()).any())
+  {
+    const double dt = static_cast<double>(fanuc_client_->getControlPeriod()) / 1000.0;
+    fr_joint_vel_ = (fr_joint_pos_ - fr_prev_joint_pos_) / dt;
+  }
+
+  for (const auto& io_state : io_state_)
+  {
+    io_state->updateValue();
+  }
+
+  robot_status_.in_error = fanuc_client_->robot_status().in_error;
+  robot_status_.tp_enabled = fanuc_client_->robot_status().tp_enabled;
+  robot_status_.e_stopped = fanuc_client_->robot_status().e_stopped;
+  robot_status_.motion_possible = fanuc_client_->robot_status().motion_possible;
+  robot_status_.contact_stop_mode = static_cast<double>(fanuc_client_->robot_status().contact_stop_mode);
+  robot_status_.collaborative_speed_scaling = static_cast<double>(fanuc_client_->robot_status().safety_scale);
+
+  force_sensor_.force_x = static_cast<double>(fanuc_client_->force_sensor().force_x);
+  force_sensor_.force_y = static_cast<double>(fanuc_client_->force_sensor().force_y);
+  force_sensor_.force_z = static_cast<double>(fanuc_client_->force_sensor().force_z);
+  force_sensor_.moment_x = static_cast<double>(fanuc_client_->force_sensor().moment_x);
+  force_sensor_.moment_y = static_cast<double>(fanuc_client_->force_sensor().moment_y);
+  force_sensor_.moment_z = static_cast<double>(fanuc_client_->force_sensor().moment_z);
+  force_sensor_.fs_type = static_cast<double>(fanuc_client_->force_sensor().fs_type);
 
   return hardware_interface::return_type::OK;
 }
@@ -595,18 +600,7 @@ hardware_interface::return_type FanucHardwareInterface::write(const rclcpp::Time
   {
     if (fanuc_client_ != nullptr)
     {
-      try
-      {
-        fanuc_client_->stopRealtimeStream();
-      }
-      catch (const std::runtime_error& e)
-      {
-        RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Stream already stopped: %s", e.what());
-      }
-      catch (...)
-      {
-        RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Exception during stream shutdown (likely normal)");
-      }
+      fanuc_client_->tryStopRealtimeStream();
     }
     // Throttle to avoid spam during shutdown
     static auto last_log_time = std::chrono::steady_clock::now();
@@ -620,29 +614,19 @@ hardware_interface::return_type FanucHardwareInterface::write(const rclcpp::Time
     return hardware_interface::return_type::ERROR;
   }
 
-  try
-  {
-    joint_targets_degrees_.array() = 180.0 / M_PI * joint_targets_.array();
-    fanuc_client_->writeJointTarget(joint_targets_degrees_);
+  joint_targets_degrees_.array() = 180.0 / M_PI * joint_targets_.array();
 
-    for (const auto& io_command : io_commands_)
-    {
-      io_command->updateBuffer();
-    }
-    fanuc_client_->sendIOCommand();
-  }
-  catch (const std::exception& e)
+  if (fanuc_client_->tryWriteJointTarget(joint_targets_degrees_) != fanuc_client::OperationStatus::kOk)
   {
-    // During shutdown, operations may fail - log but don't crash
-    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Exception during write (likely shutdown): %s", e.what());
+    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Write failed: %s", fanuc_client_->lastError().c_str());
     return hardware_interface::return_type::ERROR;
   }
-  catch (...)
+
+  for (const auto& io_command : io_commands_)
   {
-    // Catch any other exceptions during shutdown
-    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Unknown exception during write (likely shutdown)");
-    return hardware_interface::return_type::ERROR;
+    io_command->updateBuffer();
   }
+  fanuc_client_->sendIOCommand();
 
   return hardware_interface::return_type::OK;
 }
@@ -651,17 +635,10 @@ hardware_interface::CallbackReturn FanucHardwareInterface::on_shutdown(const rcl
 {
   if (fanuc_client_ != nullptr)
   {
-    try
+    if (fanuc_client_->tryStopRealtimeStream() != fanuc_client::OperationStatus::kOk)
     {
-      fanuc_client_->stopRealtimeStream();
-    }
-    catch (const std::exception& e)
-    {
-      RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Exception during shutdown stop: %s", e.what());
-    }
-    catch (...)
-    {
-      RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Unknown exception during shutdown stop");
+      RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Exception during shutdown stop: %s",
+                   fanuc_client_->lastError().c_str());
     }
   }
   robot_status_.is_connected = 0.0;
