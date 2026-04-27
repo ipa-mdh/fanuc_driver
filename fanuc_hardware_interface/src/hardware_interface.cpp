@@ -5,6 +5,7 @@
 
 #include "fanuc_robot_driver/hardware_interface.hpp"
 
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <memory>
@@ -28,6 +29,128 @@ using StatusGPIOTypes = ::fanuc_client::GPIOBuffer::StatusGPIOTypes;
 
 constexpr auto kFRHWInterface = "FR_HW_Interface";
 constexpr int kNumberConnectionAttempts = 5;
+
+enum class LogLevel
+{
+  kDebug,
+  kWarn,
+  kError,
+};
+
+struct FailureCounters
+{
+  std::atomic<uint64_t> timeout{ 0 };
+  std::atomic<uint64_t> transport{ 0 };
+  std::atomic<uint64_t> gpio{ 0 };
+  std::atomic<uint64_t> rmi{ 0 };
+  std::atomic<uint64_t> invalid_argument{ 0 };
+};
+
+FailureCounters g_failure_counters;
+
+const char* StatusToString(fanuc_client::OperationStatus status)
+{
+  switch (status)
+  {
+    case fanuc_client::OperationStatus::kOk:
+      return "ok";
+    case fanuc_client::OperationStatus::kAlreadyStreaming:
+      return "already_streaming";
+    case fanuc_client::OperationStatus::kNotStreaming:
+      return "not_streaming";
+    case fanuc_client::OperationStatus::kInvalidArgument:
+      return "invalid_argument";
+    case fanuc_client::OperationStatus::kRmiError:
+      return "rmi_error";
+    case fanuc_client::OperationStatus::kTimeout:
+      return "timeout";
+    case fanuc_client::OperationStatus::kGpioError:
+      return "gpio_error";
+    case fanuc_client::OperationStatus::kTransportError:
+      return "transport_error";
+    case fanuc_client::OperationStatus::kUnknownError:
+      return "unknown_error";
+  }
+  return "unknown_status";
+}
+
+const char* StatusActionHint(fanuc_client::OperationStatus status)
+{
+  switch (status)
+  {
+    case fanuc_client::OperationStatus::kOk:
+      return "none";
+    case fanuc_client::OperationStatus::kAlreadyStreaming:
+      return "skip duplicate start request";
+    case fanuc_client::OperationStatus::kNotStreaming:
+      return "start stream before read/write";
+    case fanuc_client::OperationStatus::kInvalidArgument:
+      return "verify configuration and command dimensions";
+    case fanuc_client::OperationStatus::kRmiError:
+      return "check TP state, alarms, and RMI setup";
+    case fanuc_client::OperationStatus::kTimeout:
+      return "check controller run state and network latency";
+    case fanuc_client::OperationStatus::kGpioError:
+      return "validate GPIO config against controller setup";
+    case fanuc_client::OperationStatus::kTransportError:
+      return "check robot connectivity and transport channels";
+    case fanuc_client::OperationStatus::kUnknownError:
+      return "inspect detailed logs and robot diagnostics";
+  }
+  return "inspect detailed logs and robot diagnostics";
+}
+
+void IncrementFailureCounter(fanuc_client::OperationStatus status)
+{
+  // Metrics hook point for future telemetry export.
+  switch (status)
+  {
+    case fanuc_client::OperationStatus::kTimeout:
+      g_failure_counters.timeout.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case fanuc_client::OperationStatus::kTransportError:
+      g_failure_counters.transport.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case fanuc_client::OperationStatus::kGpioError:
+      g_failure_counters.gpio.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case fanuc_client::OperationStatus::kRmiError:
+      g_failure_counters.rmi.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case fanuc_client::OperationStatus::kInvalidArgument:
+      g_failure_counters.invalid_argument.fetch_add(1, std::memory_order_relaxed);
+      return;
+    default:
+      return;
+  }
+}
+
+void LogOperationStatus(LogLevel level, const char* operation, fanuc_client::OperationStatus status,
+                        const std::string& detail)
+{
+  IncrementFailureCounter(status);
+  const auto* status_text = StatusToString(status);
+  const auto* action = StatusActionHint(status);
+
+  switch (level)
+  {
+    case LogLevel::kDebug:
+      RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface),
+                   "hw_interface | op=%s | status=%s | detail=%s | action_hint=%s", operation, status_text,
+                   detail.c_str(), action);
+      return;
+    case LogLevel::kWarn:
+      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface),
+                  "hw_interface | op=%s | status=%s | detail=%s | action_hint=%s", operation, status_text,
+                  detail.c_str(), action);
+      return;
+    case LogLevel::kError:
+      RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface),
+                   "hw_interface | op=%s | status=%s | detail=%s | action_hint=%s", operation, status_text,
+                   detail.c_str(), action);
+      return;
+  }
+}
 
 bool StringToInt(const std::string& param_name, const std::string& param_value, int& out_value)
 {
@@ -384,21 +507,26 @@ FanucHardwareInterface::on_configure(const rclcpp_lifecycle::State& /*previous_s
     fanuc_client_->setOutCmdInterpBuffTarget(out_cmd_interp_buff_target_);
     fanuc_client_->setForceSensorType(force_sensor_type_);
 
-    if (fanuc_client_->tryStartRMI() != fanuc_client::OperationStatus::kOk)
+    const auto start_rmi_status = fanuc_client_->tryStartRMI();
+    if (start_rmi_status != fanuc_client::OperationStatus::kOk)
     {
-      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", fanuc_client_->lastError().c_str());
+      LogOperationStatus(LogLevel::kWarn, "on_configure.tryStartRMI", start_rmi_status, fanuc_client_->lastError());
       rclcpp::sleep_for(std::chrono::milliseconds(3000));
       continue;
     }
-    if (fanuc_client_->trySetPayloadSchedule(payload_schedule_) != fanuc_client::OperationStatus::kOk)
+    const auto set_payload_status = fanuc_client_->trySetPayloadSchedule(payload_schedule_);
+    if (set_payload_status != fanuc_client::OperationStatus::kOk)
     {
-      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", fanuc_client_->lastError().c_str());
+      LogOperationStatus(LogLevel::kWarn, "on_configure.trySetPayloadSchedule", set_payload_status,
+                         fanuc_client_->lastError());
       rclcpp::sleep_for(std::chrono::milliseconds(3000));
       continue;
     }
-    if (fanuc_client_->tryValidateGPIOBuffer(gpio_buffer_) != fanuc_client::OperationStatus::kOk)
+    const auto validate_gpio_status = fanuc_client_->tryValidateGPIOBuffer(gpio_buffer_);
+    if (validate_gpio_status != fanuc_client::OperationStatus::kOk)
     {
-      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", fanuc_client_->lastError().c_str());
+      LogOperationStatus(LogLevel::kWarn, "on_configure.tryValidateGPIOBuffer", validate_gpio_status,
+                         fanuc_client_->lastError());
       rclcpp::sleep_for(std::chrono::milliseconds(3000));
       continue;
     }
@@ -423,19 +551,21 @@ hardware_interface::CallbackReturn FanucHardwareInterface::on_activate(const rcl
     return CallbackReturn::ERROR;
   }
 
-  if (fanuc_client_->tryStartRealtimeStream(gpio_buffer_) != fanuc_client::OperationStatus::kOk)
+  const auto start_stream_status = fanuc_client_->tryStartRealtimeStream(gpio_buffer_);
+  if (start_stream_status != fanuc_client::OperationStatus::kOk)
   {
     robot_status_.is_connected = 0.0;
-    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Failed to activate hardware interface: %s",
-                 fanuc_client_->lastError().c_str());
+    LogOperationStatus(LogLevel::kError, "on_activate.tryStartRealtimeStream", start_stream_status,
+                       fanuc_client_->lastError());
     return CallbackReturn::ERROR;
   }
 
-  if (fanuc_client_->tryReadJointAngles() != fanuc_client::OperationStatus::kOk)
+  const auto read_initial_status = fanuc_client_->tryReadJointAngles();
+  if (read_initial_status != fanuc_client::OperationStatus::kOk)
   {
     robot_status_.is_connected = 0.0;
-    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Failed to read initial joint state: %s",
-                 fanuc_client_->lastError().c_str());
+    LogOperationStatus(LogLevel::kError, "on_activate.tryReadJointAngles", read_initial_status,
+                       fanuc_client_->lastError());
     return CallbackReturn::ERROR;
   }
 
@@ -451,10 +581,11 @@ hardware_interface::CallbackReturn FanucHardwareInterface::on_deactivate(const r
 
   if (fanuc_client_ != nullptr)
   {
-    if (fanuc_client_->tryStopRealtimeStream() != fanuc_client::OperationStatus::kOk)
+    const auto stop_status = fanuc_client_->tryStopRealtimeStream();
+    if (stop_status != fanuc_client::OperationStatus::kOk)
     {
-      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "Exception during deactivate: %s",
-                  fanuc_client_->lastError().c_str());
+      LogOperationStatus(LogLevel::kWarn, "on_deactivate.tryStopRealtimeStream", stop_status,
+                         fanuc_client_->lastError());
     }
   }
 
@@ -552,9 +683,10 @@ hardware_interface::return_type FanucHardwareInterface::read(const rclcpp::Time&
     return hardware_interface::return_type::ERROR;
   }
 
-  if (fanuc_client_->tryReadJointAngles() != fanuc_client::OperationStatus::kOk)
+  const auto read_status = fanuc_client_->tryReadJointAngles();
+  if (read_status != fanuc_client::OperationStatus::kOk)
   {
-    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Read failed: %s", fanuc_client_->lastError().c_str());
+    LogOperationStatus(LogLevel::kDebug, "read.tryReadJointAngles", read_status, fanuc_client_->lastError());
     return hardware_interface::return_type::ERROR;
   }
 
@@ -616,9 +748,10 @@ hardware_interface::return_type FanucHardwareInterface::write(const rclcpp::Time
 
   joint_targets_degrees_.array() = 180.0 / M_PI * joint_targets_.array();
 
-  if (fanuc_client_->tryWriteJointTarget(joint_targets_degrees_) != fanuc_client::OperationStatus::kOk)
+  const auto write_status = fanuc_client_->tryWriteJointTarget(joint_targets_degrees_);
+  if (write_status != fanuc_client::OperationStatus::kOk)
   {
-    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Write failed: %s", fanuc_client_->lastError().c_str());
+    LogOperationStatus(LogLevel::kDebug, "write.tryWriteJointTarget", write_status, fanuc_client_->lastError());
     return hardware_interface::return_type::ERROR;
   }
 
@@ -635,10 +768,11 @@ hardware_interface::CallbackReturn FanucHardwareInterface::on_shutdown(const rcl
 {
   if (fanuc_client_ != nullptr)
   {
-    if (fanuc_client_->tryStopRealtimeStream() != fanuc_client::OperationStatus::kOk)
+    const auto stop_status = fanuc_client_->tryStopRealtimeStream();
+    if (stop_status != fanuc_client::OperationStatus::kOk)
     {
-      RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Exception during shutdown stop: %s",
-                   fanuc_client_->lastError().c_str());
+      LogOperationStatus(LogLevel::kDebug, "on_shutdown.tryStopRealtimeStream", stop_status,
+                         fanuc_client_->lastError());
     }
   }
   robot_status_.is_connected = 0.0;

@@ -455,11 +455,23 @@ OperationStatus FanucClient::tryStartRMI() noexcept
   }
   catch (const std::runtime_error&)
   {
-    std::cout << "Need to reset and abort" << std::endl;
-    rmi_connection_->abort(std::nullopt);
-    rmi_connection_->reset(std::nullopt);
-    rmi_connection_->getStatus(std::nullopt);
-    rmi_connection_->initializeRemoteMotion(std::nullopt);
+    try
+    {
+      rmi_connection_->abort(std::nullopt);
+      rmi_connection_->reset(std::nullopt);
+      rmi_connection_->getStatus(std::nullopt);
+      rmi_connection_->initializeRemoteMotion(std::nullopt);
+    }
+    catch (const std::exception& e)
+    {
+      setLastError(e.what());
+      return OperationStatus::kRmiError;
+    }
+    catch (...)
+    {
+      setLastError("Unknown exception while recovering and starting RMI.");
+      return OperationStatus::kUnknownError;
+    }
   }
   catch (const std::exception& e)
   {
@@ -584,7 +596,7 @@ OperationStatus FanucClient::tryStartRealtimeStream(std::shared_ptr<GPIOBuffer> 
     {
     }
 
-    return OperationStatus::kUnknownError;
+    return OperationStatus::kTransportError;
   }
   catch (...)
   {

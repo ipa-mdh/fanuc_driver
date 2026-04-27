@@ -91,6 +91,115 @@ private:
   std::atomic<bool>& stream_connected_;
 };
 
+class ScenarioStreamMotionConnection : public stream_motion::StreamMotionInterface
+{
+public:
+  enum class Mode
+  {
+    kReady,
+    kNeverPacket,
+    kNeverReady,
+    kFailFirstStartThenReady,
+  };
+
+  ScenarioStreamMotionConnection(std::atomic<bool>& stream_connected, Mode mode)
+    : stream_connected_{ stream_connected }, mode_{ mode }
+  {
+    status_.status = 15;
+    status_.joint_angle = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+  }
+
+  void sendStartPacket() const override
+  {
+    ++start_count_;
+    stream_connected_ = true;
+  }
+
+  void sendStopPacket() const override
+  {
+    stream_connected_ = false;
+  }
+
+  void sendCommand(const std::array<double, stream_motion::kMaxAxisNumber>& command_pos, bool is_last_command,
+                   const std::array<uint8_t, 256>& io_command) const override
+  {
+    for (int i = 0; i < stream_motion::kMaxAxisNumber; ++i)
+    {
+      status_.joint_angle[i] = static_cast<float>(command_pos[i]);
+    }
+  }
+
+  bool getStatusPacket(stream_motion::RobotStatusPacket& status) override
+  {
+    if (!stream_connected_)
+    {
+      return false;
+    }
+
+    switch (mode_)
+    {
+      case Mode::kReady:
+        status = status_;
+        return true;
+      case Mode::kNeverPacket:
+        return false;
+      case Mode::kNeverReady:
+        status = status_;
+        status.status = static_cast<uint16_t>(status.status & ~0x1U);
+        return true;
+      case Mode::kFailFirstStartThenReady:
+        if (start_count_ == 1)
+        {
+          return false;
+        }
+        status = status_;
+        return true;
+    }
+
+    return false;
+  }
+
+  bool getRobotLimits(const uint32_t axis_number, stream_motion::RobotThresholdPacket& robot_threshold_velocity,
+                      stream_motion::RobotThresholdPacket& robot_threshold_acceleration,
+                      stream_motion::RobotThresholdPacket& robot_threshold_jerk) const override
+  {
+    robot_threshold_velocity.axis_number = axis_number;
+    robot_threshold_acceleration.axis_number = axis_number;
+    robot_threshold_jerk.axis_number = axis_number;
+    for (int i = 0; i < 20; ++i)
+    {
+      robot_threshold_velocity.full_payload[i] = 200.0f;
+      robot_threshold_velocity.no_payload[i] = 200.0f;
+      robot_threshold_acceleration.full_payload[i] = 2000.0f;
+      robot_threshold_acceleration.no_payload[i] = 2000.0f;
+      robot_threshold_jerk.full_payload[i] = 20000.0f;
+      robot_threshold_jerk.no_payload[i] = 20000.0f;
+    }
+    return true;
+  }
+
+  bool configureGPIO(const stream_motion::GPIOConfiguration& config) const override
+  {
+    return true;
+  }
+
+  bool getControllerCapability(stream_motion::ControllerCapabilityResultPacket& controller_capability) override
+  {
+    controller_capability.sampling_rate = 8;
+    return true;
+  }
+
+  void configureForceSensor(uint32_t do_reset, uint32_t force_sensor_type) const override
+  {
+  }
+
+private:
+  mutable stream_motion::RobotStatusPacket status_;
+  std::atomic<bool>& stream_connected_;
+  Mode mode_;
+  mutable std::atomic<int> start_count_{ 0 };
+};
+
 class MockRMIConnection : public rmi::RMIConnectionInterface
 {
 public:
@@ -228,6 +337,81 @@ TEST(FanucClientTest, TestGetLimits)
     EXPECT_EQ(vel_limit[i], 200.0f);
     EXPECT_EQ(acc_limit[i], 2000.0f);
     EXPECT_EQ(jerk_limit[i], 20000.0f);
+  }
+}
+
+TEST(FanucClientTest, TestTryStartAlreadyStreamingAndIdempotentStop)
+{
+  std::atomic<bool> stream_connected = false;
+  auto stream_motion_interface =
+      std::make_unique<ScenarioStreamMotionConnection>(stream_connected, ScenarioStreamMotionConnection::Mode::kReady);
+  auto rmi_interface = std::make_unique<NiceMockRMIConnection>();
+  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, 16001, std::move(stream_motion_interface),
+                                         std::move(rmi_interface));
+
+  EXPECT_EQ(fanuc_client.tryStopRealtimeStream(), fanuc_client::OperationStatus::kOk);
+  EXPECT_EQ(fanuc_client.tryStartRealtimeStream(), fanuc_client::OperationStatus::kOk);
+  EXPECT_TRUE(stream_connected);
+  EXPECT_EQ(fanuc_client.tryStartRealtimeStream(), fanuc_client::OperationStatus::kAlreadyStreaming);
+  EXPECT_THAT(fanuc_client.lastError(), testing::HasSubstr("Cannot start stream twice"));
+  EXPECT_EQ(fanuc_client.tryStopRealtimeStream(), fanuc_client::OperationStatus::kOk);
+  EXPECT_EQ(fanuc_client.tryStopRealtimeStream(), fanuc_client::OperationStatus::kOk);
+}
+
+TEST(FanucClientTest, TestTryStartFailsWithNoStatusPacket)
+{
+  std::atomic<bool> stream_connected = false;
+  auto stream_motion_interface = std::make_unique<ScenarioStreamMotionConnection>(
+      stream_connected, ScenarioStreamMotionConnection::Mode::kNeverPacket);
+  auto rmi_interface = std::make_unique<NiceMockRMIConnection>();
+  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, 16001, std::move(stream_motion_interface),
+                                         std::move(rmi_interface));
+
+  EXPECT_EQ(fanuc_client.tryStartRealtimeStream(), fanuc_client::OperationStatus::kTransportError);
+  EXPECT_THAT(fanuc_client.lastError(), testing::HasSubstr("Invalid robot status packet"));
+}
+
+TEST(FanucClientTest, TestTryStartFailsWhenStreamNotReady)
+{
+  std::atomic<bool> stream_connected = false;
+  auto stream_motion_interface =
+      std::make_unique<ScenarioStreamMotionConnection>(stream_connected, ScenarioStreamMotionConnection::Mode::kNeverReady);
+  auto rmi_interface = std::make_unique<NiceMockRMIConnection>();
+  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, 16001, std::move(stream_motion_interface),
+                                         std::move(rmi_interface));
+
+  EXPECT_EQ(fanuc_client.tryStartRealtimeStream(), fanuc_client::OperationStatus::kTimeout);
+  EXPECT_THAT(fanuc_client.lastError(), testing::HasSubstr("Stream motion control is not ready"));
+}
+
+TEST(FanucClientTest, TestReconnectAfterTransientTransportFailure)
+{
+  std::atomic<bool> stream_connected = false;
+  auto stream_motion_interface = std::make_unique<ScenarioStreamMotionConnection>(
+      stream_connected, ScenarioStreamMotionConnection::Mode::kFailFirstStartThenReady);
+  auto rmi_interface = std::make_unique<NiceMockRMIConnection>();
+  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, 16001, std::move(stream_motion_interface),
+                                         std::move(rmi_interface));
+
+  EXPECT_EQ(fanuc_client.tryStartRealtimeStream(), fanuc_client::OperationStatus::kTransportError);
+  EXPECT_EQ(fanuc_client.tryStartRealtimeStream(), fanuc_client::OperationStatus::kOk);
+  EXPECT_TRUE(stream_connected);
+  EXPECT_EQ(fanuc_client.tryStopRealtimeStream(), fanuc_client::OperationStatus::kOk);
+}
+
+TEST(FanucClientTest, TestRapidStartStopBurst)
+{
+  std::atomic<bool> stream_connected = false;
+  auto stream_motion_interface =
+      std::make_unique<ScenarioStreamMotionConnection>(stream_connected, ScenarioStreamMotionConnection::Mode::kReady);
+  auto rmi_interface = std::make_unique<NiceMockRMIConnection>();
+  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, 16001, std::move(stream_motion_interface),
+                                         std::move(rmi_interface));
+
+  for (int i = 0; i < 5; ++i)
+  {
+    EXPECT_EQ(fanuc_client.tryStartRealtimeStream(), fanuc_client::OperationStatus::kOk);
+    EXPECT_EQ(fanuc_client.tryStopRealtimeStream(), fanuc_client::OperationStatus::kOk);
   }
 }
 
