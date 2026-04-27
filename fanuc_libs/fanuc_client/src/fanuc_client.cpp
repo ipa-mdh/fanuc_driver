@@ -106,6 +106,26 @@ FanucClient::FanucClient(std::string robot_ip, const uint16_t stream_motion_port
   setupSignalHandler();
 }
 
+std::unique_ptr<FanucClient> FanucClient::tryCreate(std::string robot_ip, const uint16_t stream_motion_port,
+                                                    const uint16_t rmi_port, std::string& error_message) noexcept
+{
+  try
+  {
+    error_message.clear();
+    return std::make_unique<FanucClient>(std::move(robot_ip), stream_motion_port, rmi_port);
+  }
+  catch (const std::exception& e)
+  {
+    error_message = e.what();
+    return nullptr;
+  }
+  catch (...)
+  {
+    error_message = "Unknown exception while creating FanucClient.";
+    return nullptr;
+  }
+}
+
 FanucClient::~FanucClient()
 {
   if (is_streaming_)

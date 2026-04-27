@@ -523,46 +523,43 @@ controller_interface::InterfaceConfiguration FanucGPIOController::state_interfac
 
 void FanucGPIOController::publishRobotStatusExt()
 {
+  if (shutting_down_.load())
+  {
+    return;
+  }
+
+  if (!robot_status_ext_publisher_)
+  {
+    return;
+  }
+
+  auto node = get_node();
+  if (!node)
+  {
+    return;
+  }
+
+  const auto node_base = node->get_node_base_interface();
+  if (!node_base)
+  {
+    return;
+  }
+
+  const auto context = node_base->get_context();
+  if (!context || !context->is_valid())
+  {
+    return;
+  }
+
+  const auto rmi_instance = getRMIInstance();
+  if (!rmi_instance)
+  {
+    return;
+  }
+
   try
   {
-    // Early return if shutting down
-    if (shutting_down_.load())
-    {
-      return;
-    }
-
-    // Check if publisher is still valid (ROS2 context might be shutting down)
-    if (!robot_status_ext_publisher_)
-    {
-      return;
-    }
-
-    // Check if node context is still valid
-    auto node = get_node();
-    if (!node)
-    {
-      return;
-    }
-
-    // Check context validity - this might throw during shutdown
-    bool context_valid = false;
-    try
-    {
-      context_valid = node->get_node_base_interface()->get_context()->is_valid();
-    }
-    catch (...)
-    {
-      // Context is being destroyed
-      return;
-    }
-
-    if (!context_valid)
-    {
-      return;
-    }
-
-    // Try to get RMI instance and publish - all operations might fail during shutdown
-    rmi::GetExtendedStatusPacket::Response robot_status_ext = getRMIInstance()->getExtendedStatus(1.0);
+    rmi::GetExtendedStatusPacket::Response robot_status_ext = rmi_instance->getExtendedStatus(1.0);
     robot_status_ext_msg_.drives_powered = robot_status_ext.DrivesPowered;
     robot_status_ext_msg_.error_code = robot_status_ext.ErrorCode.has_value() ? robot_status_ext.ErrorCode.value() : "";
     robot_status_ext_msg_.gen_override = robot_status_ext.GenOverride;
@@ -572,16 +569,17 @@ void FanucGPIOController::publishRobotStatusExt()
     robot_status_ext_msg_.control_mode =
         robot_status_ext.ControlMode.has_value() ? robot_status_ext.ControlMode.value() : "";
 
-    // Final check before publishing - publisher might be invalid even if pointer is valid
-    if (robot_status_ext_publisher_)
-    {
-      robot_status_ext_publisher_->publish(robot_status_ext_msg_);
-    }
+    robot_status_ext_publisher_->publish(robot_status_ext_msg_);
   }
-  catch (...)
+  catch (const std::exception& e)
   {
-    // Catch ALL exceptions including segfaults that manifest as exceptions
-    // Silently ignore during shutdown
+    static auto last_log_time = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_log_time).count() > 5000)
+    {
+      RCLCPP_WARN(rclcpp::get_logger(kFRGPIOController), "publishRobotStatusExt failed: %s", e.what());
+      last_log_time = now;
+    }
   }
 }
 

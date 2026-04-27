@@ -492,14 +492,12 @@ FanucHardwareInterface::on_configure(const rclcpp_lifecycle::State& /*previous_s
   for (int i = 0; i < kNumberConnectionAttempts; i++)
   {
     RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "Connecting to the robot: attempt: " << i);
-    try
+    fanuc_client_.reset();
+    std::string create_error;
+    fanuc_client_ = fanuc_client::FanucClient::tryCreate(ip_address_, stream_motion_port_, rmi_port_, create_error);
+    if (fanuc_client_ == nullptr)
     {
-      fanuc_client_.reset();
-      fanuc_client_ = std::make_unique<fanuc_client::FanucClient>(ip_address_, stream_motion_port_, rmi_port_);
-    }
-    catch (const std::exception& e)
-    {
-      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", e.what());
+      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "%s", create_error.c_str());
       rclcpp::sleep_for(std::chrono::milliseconds(3000));
       continue;
     }

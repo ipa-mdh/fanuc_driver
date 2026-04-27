@@ -71,6 +71,9 @@ public:
                        std::unique_ptr<stream_motion::StreamMotionInterface> stream_motion_interface = nullptr,
                        std::unique_ptr<rmi::RMIConnectionInterface> rmi_connection_interface = nullptr);
 
+  static std::unique_ptr<FanucClient> tryCreate(std::string robot_ip, uint16_t stream_motion_port, uint16_t rmi_port,
+                                                std::string& error_message) noexcept;
+
   FanucClient(const FanucClient&) = delete;
   FanucClient& operator=(const FanucClient&) = delete;
 
