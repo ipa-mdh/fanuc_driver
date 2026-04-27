@@ -465,66 +465,104 @@ void FanucClient::startRealtimeStream(std::shared_ptr<GPIOBuffer> gpio_buffer)
 {
   AssertNotStreaming(is_streaming_);
 
-  stream_motion_->sendStopPacket();
-
-  gpio_buffer_ = std::move(gpio_buffer);
-  if (gpio_buffer_ != nullptr)
-  {
-    stream_motion_->configureGPIO(gpio_buffer_->toStreamMotionConfig());
-  }
-
-  startRMI();
-  rmi_connection_->programCallNonBlocking("STREAM_MOTN");
-
-  // Wait for the stream connection to be ready
   stream_motion::RobotStatusPacket status;
-  stream_motion_->sendStartPacket();
-  stream_motion_->configureForceSensor(0, force_sensor_type_);
-  const auto pre_loop_time = std::chrono::steady_clock::now();
-  bool got_status = false;
-  while (true)
+  try
   {
-    if (stream_motion_->getStatusPacket(status))
-    {
-      got_status = true;
-      if (status.status & 0x1)
-      {
-        /* STREAM_MOTN.TP is ready */
-        break;
-      }
-    }
-    if (std::chrono::steady_clock::now() - pre_loop_time > std::chrono::seconds(2))
-    {
-      if (got_status)
-      {
-        throw std::runtime_error(kStatusStatusNotReadyMessage);
-      }
-      else
-      {
-        throw std::runtime_error(kStatusPacketFailureMessage);
-      }
-    }
-  }
-  start_time_ = std::chrono::high_resolution_clock::now();
-  p_queue_impl_->robot_state_queue_.enqueue(status);
-  is_streaming_ = true;
-  last_joint_angles_ = Eigen::VectorXd::Zero(status.joint_angle.size());
-  for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)
-  {
-    last_joint_angles_[i] = static_cast<double>(status.joint_angle[i]);
-    command_pos[i] = static_cast<double>(status.joint_angle[i]);
-  }
-  stream_motion_->sendCommand(command_pos, false, {});
+    stream_motion_->sendStopPacket();
 
-  if (rt_thread_.joinable())
-  {
-    rt_thread_.join();
+    gpio_buffer_ = std::move(gpio_buffer);
+    if (gpio_buffer_ != nullptr)
+    {
+      stream_motion_->configureGPIO(gpio_buffer_->toStreamMotionConfig());
+    }
+
+    startRMI();
+    rmi_connection_->programCallNonBlocking("STREAM_MOTN");
+
+    // Wait for the stream connection to be ready
+    stream_motion_->sendStartPacket();
+    stream_motion_->configureForceSensor(0, force_sensor_type_);
+    const auto pre_loop_time = std::chrono::steady_clock::now();
+    bool got_status = false;
+    while (true)
+    {
+      if (stream_motion_->getStatusPacket(status))
+      {
+        got_status = true;
+        if (status.status & 0x1)
+        {
+          /* STREAM_MOTN.TP is ready */
+          break;
+        }
+      }
+      if (std::chrono::steady_clock::now() - pre_loop_time > std::chrono::seconds(2))
+      {
+        if (got_status)
+        {
+          throw std::runtime_error(kStatusStatusNotReadyMessage);
+        }
+        else
+        {
+          throw std::runtime_error(kStatusPacketFailureMessage);
+        }
+      }
+    }
+
+    start_time_ = std::chrono::high_resolution_clock::now();
+    p_queue_impl_->robot_state_queue_.enqueue(status);
+    is_streaming_ = true;
+    last_joint_angles_ = Eigen::VectorXd::Zero(status.joint_angle.size());
+    for (Eigen::Index i = 0; i < status.joint_angle.size(); ++i)
+    {
+      last_joint_angles_[i] = static_cast<double>(status.joint_angle[i]);
+      command_pos[i] = static_cast<double>(status.joint_angle[i]);
+    }
+    stream_motion_->sendCommand(command_pos, false, {});
+
+    if (rt_thread_.joinable())
+    {
+      rt_thread_.join();
+    }
+    rt_thread_ = std::thread([this] { streamMotionThread(last_joint_angles_); });
   }
-  rt_thread_ = std::thread([this] { streamMotionThread(last_joint_angles_); });
+  catch (...)
+  {
+    is_streaming_ = false;
+
+    try
+    {
+      rmi_connection_->abort(std::nullopt);
+      rmi_running_ = false;
+    }
+    catch (...)
+    {
+    }
+
+    try
+    {
+      stream_motion_->sendStopPacket();
+    }
+    catch (...)
+    {
+    }
+
+    throw;
+  }
 }
 
 void FanucClient::stopRealtimeStream()
 {
+  if (!is_streaming_)
+  {
+    if (rmi_running_)
+    {
+      rmi_connection_->abort(std::nullopt);
+      rmi_running_ = false;
+      stream_motion_->sendStopPacket();
+    }
+    return;
+  }
+
   is_streaming_ = false;
   if (rt_thread_.joinable())
   {
@@ -552,6 +590,7 @@ void FanucClient::stopRealtimeStream()
   } while (status.status & 0x8);
 
   rmi_connection_->abort(std::nullopt);
+  rmi_running_ = false;
   stream_motion_->sendStopPacket();
 }
 

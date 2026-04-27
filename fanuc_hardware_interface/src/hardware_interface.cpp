@@ -386,22 +386,61 @@ hardware_interface::CallbackReturn FanucHardwareInterface::on_activate(const rcl
 {
   RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "activating hardware interface");
 
-  fanuc_client_->startRealtimeStream(gpio_buffer_);
-  joint_targets_degrees_ = fanuc_client_->readJointAngles();
-  joint_targets_.array() = M_PI / 180.0 * joint_targets_degrees_.array();
+  if (fanuc_client_ == nullptr)
+  {
+    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Cannot activate: FANUC client is not initialized.");
+    return CallbackReturn::ERROR;
+  }
 
-  return CallbackReturn::SUCCESS;
+  try
+  {
+    fanuc_client_->startRealtimeStream(gpio_buffer_);
+    joint_targets_degrees_ = fanuc_client_->readJointAngles();
+    joint_targets_.array() = M_PI / 180.0 * joint_targets_degrees_.array();
+    robot_status_.is_connected = 1.0;
+    return CallbackReturn::SUCCESS;
+  }
+  catch (const std::exception& e)
+  {
+    robot_status_.is_connected = 0.0;
+    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Failed to activate hardware interface: %s", e.what());
+    return CallbackReturn::ERROR;
+  }
+  catch (...)
+  {
+    robot_status_.is_connected = 0.0;
+    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Failed to activate hardware interface: unknown exception.");
+    return CallbackReturn::ERROR;
+  }
 }
 
 hardware_interface::CallbackReturn FanucHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& previous_state)
 {
   RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "deactivating stream motion");
-  fanuc_client_->stopRealtimeStream();
+
+  if (fanuc_client_ != nullptr)
+  {
+    try
+    {
+      fanuc_client_->stopRealtimeStream();
+    }
+    catch (const std::exception& e)
+    {
+      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "Exception during deactivate: %s", e.what());
+    }
+    catch (...)
+    {
+      RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "Unknown exception during deactivate.");
+    }
+  }
+
+  robot_status_.is_connected = 0.0;
   return CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn FanucHardwareInterface::on_cleanup(const rclcpp_lifecycle::State& previous_state)
 {
+  robot_status_.is_connected = 0.0;
   fanuc_client_.reset();
   return CallbackReturn::SUCCESS;
 }
@@ -610,6 +649,23 @@ hardware_interface::return_type FanucHardwareInterface::write(const rclcpp::Time
 
 hardware_interface::CallbackReturn FanucHardwareInterface::on_shutdown(const rclcpp_lifecycle::State& previous_state)
 {
+  if (fanuc_client_ != nullptr)
+  {
+    try
+    {
+      fanuc_client_->stopRealtimeStream();
+    }
+    catch (const std::exception& e)
+    {
+      RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Exception during shutdown stop: %s", e.what());
+    }
+    catch (...)
+    {
+      RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Unknown exception during shutdown stop");
+    }
+  }
+  robot_status_.is_connected = 0.0;
+  fanuc_client_.reset();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 }  // namespace fanuc_robot_driver
